@@ -22,6 +22,7 @@
 #pragma clang diagnostic ignored "-Wextra"
 
 #include "RefreshRateConfigs.h"
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <utils/Trace.h>
 #include <chrono>
@@ -113,7 +114,7 @@ bool RefreshRateConfigs::isVoteAllowed(const LayerRequirement& layer,
         case LayerVoteType::ExplicitExactOrMultiple:
         case LayerVoteType::Heuristic:
             if (mConfig.frameRateMultipleThreshold != 0 &&
-                refreshRate.fps.greaterThanOrEqualWithMargin(
+                refreshRate.getFps().greaterThanOrEqualWithMargin(
                         Fps(mConfig.frameRateMultipleThreshold)) &&
                 layer.desiredRefreshRate.lessThanWithMargin(
                         Fps(mConfig.frameRateMultipleThreshold / 2))) {
@@ -131,68 +132,6 @@ bool RefreshRateConfigs::isVoteAllowed(const LayerRequirement& layer,
             break;
     }
     return true;
-}
-
-float RefreshRateConfigs::calculateNonExactMatchingLayerScoreLocked(
-        const LayerRequirement& layer, const RefreshRate& refreshRate) const {
-    constexpr float kScoreForFractionalPairs = .8f;
-
-    const auto displayPeriod = refreshRate.getVsyncPeriod();
-    const auto layerPeriod = layer.desiredRefreshRate.getPeriodNsecs();
-    if (layer.vote == LayerVoteType::ExplicitDefault) {
-        // Find the actual rate the layer will render, assuming
-        // that layerPeriod is the minimal period to render a frame.
-        // For example if layerPeriod is 20ms and displayPeriod is 16ms,
-        // then the actualLayerPeriod will be 32ms, because it is the
-        // smallest multiple of the display period which is >= layerPeriod.
-        auto actualLayerPeriod = displayPeriod;
-        int multiplier = 1;
-        while (layerPeriod > actualLayerPeriod + MARGIN_FOR_PERIOD_CALCULATION) {
-            multiplier++;
-            actualLayerPeriod = displayPeriod * multiplier;
-        }
-
-        // Because of the threshold we used above it's possible that score is slightly
-        // above 1.
-        return std::min(1.0f,
-                        static_cast<float>(layerPeriod) / static_cast<float>(actualLayerPeriod));
-    }
-
-    if (layer.vote == LayerVoteType::ExplicitExactOrMultiple ||
-        layer.vote == LayerVoteType::Heuristic) {
-        if (isFractionalPairOrMultiple(refreshRate.getFps(), layer.desiredRefreshRate)) {
-            return kScoreForFractionalPairs;
-        }
-
-        // Calculate how many display vsyncs we need to present a single frame for this
-        // layer
-        const auto [displayFramesQuotient, displayFramesRemainder] =
-                getDisplayFrames(layerPeriod, displayPeriod);
-        static constexpr size_t MAX_FRAMES_TO_FIT = 10; // Stop calculating when score < 0.1
-        if (displayFramesRemainder == 0) {
-            // Layer desired refresh rate matches the display rate.
-            return 1.0f;
-        }
-
-        if (displayFramesQuotient == 0) {
-            // Layer desired refresh rate is higher than the display rate.
-            return (static_cast<float>(layerPeriod) / static_cast<float>(displayPeriod)) *
-                    (1.0f / (MAX_FRAMES_TO_FIT + 1));
-        }
-
-        // Layer desired refresh rate is lower than the display rate. Check how well it fits
-        // the cadence.
-        auto diff = std::abs(displayFramesRemainder - (displayPeriod - displayFramesRemainder));
-        int iter = 2;
-        while (diff > MARGIN_FOR_PERIOD_CALCULATION && iter < MAX_FRAMES_TO_FIT) {
-            diff = diff - (displayPeriod - diff);
-            iter++;
-        }
-
-        return (1.0f / iter);
-    }
-
-    return 0;
 }
 
 float RefreshRateConfigs::calculateLayerScoreLocked(const LayerRequirement& layer,
@@ -214,6 +153,51 @@ float RefreshRateConfigs::calculateLayerScoreLocked(const LayerRequirement& laye
         return ratio * ratio;
     }
 
+    const auto displayPeriod = refreshRate.getVsyncPeriod();
+    const auto layerPeriod = layer.desiredRefreshRate.getPeriodNsecs();
+    if (layer.vote == LayerVoteType::ExplicitDefault) {
+        // Find the actual rate the layer will render, assuming
+        // that layerPeriod is the minimal time to render a frame
+        auto actualLayerPeriod = displayPeriod;
+        int multiplier = 1;
+        while (layerPeriod > actualLayerPeriod + MARGIN_FOR_PERIOD_CALCULATION) {
+            multiplier++;
+            actualLayerPeriod = displayPeriod * multiplier;
+        }
+        return std::min(1.0f,
+                        static_cast<float>(layerPeriod) / static_cast<float>(actualLayerPeriod));
+    }
+
+    if (layer.vote == LayerVoteType::ExplicitExactOrMultiple ||
+        layer.vote == LayerVoteType::Heuristic) {
+        // Calculate how many display vsyncs we need to present a single frame for this
+        // layer
+        const auto [displayFramesQuotient, displayFramesRemainder] =
+                getDisplayFrames(layerPeriod, displayPeriod);
+        static constexpr size_t MAX_FRAMES_TO_FIT = 10; // Stop calculating when score < 0.1
+        if (displayFramesRemainder == 0) {
+            // Layer desired refresh rate matches the display rate.
+            return 1.0f * seamlessness;
+        }
+
+        if (displayFramesQuotient == 0) {
+            // Layer desired refresh rate is higher than the display rate.
+            return (static_cast<float>(layerPeriod) / static_cast<float>(displayPeriod)) *
+                    (1.0f / (MAX_FRAMES_TO_FIT + 1));
+        }
+
+        // Layer desired refresh rate is lower than the display rate. Check how well it fits
+        // the cadence.
+        auto diff = std::abs(displayFramesRemainder - (displayPeriod - displayFramesRemainder));
+        int iter = 2;
+        while (diff > MARGIN_FOR_PERIOD_CALCULATION && iter < MAX_FRAMES_TO_FIT) {
+            diff = diff - (displayPeriod - diff);
+            iter++;
+        }
+
+        return (1.0f / iter) * seamlessness;
+    }
+
     if (layer.vote == LayerVoteType::ExplicitExact) {
         const int divider = getFrameRateDivider(refreshRate.getFps(), layer.desiredRefreshRate);
         if (mSupportsFrameRateOverride) {
@@ -226,18 +210,7 @@ float RefreshRateConfigs::calculateLayerScoreLocked(const LayerRequirement& laye
         return divider == 1;
     }
 
-    // If the layer frame rate is a divider of the refresh rate it should score
-    // the highest score.
-    if (getFrameRateDivider(refreshRate.getFps(), layer.desiredRefreshRate) > 0) {
-        return 1.0f * seamlessness;
-    }
-
-    // The layer frame rate is not a divider of the refresh rate,
-    // there is a small penalty attached to the score to favor the frame rates
-    // the exactly matches the display refresh rate or a multiple.
-    constexpr float kNonExactMatchingPenalty = 0.95f;
-    return calculateNonExactMatchingLayerScoreLocked(layer, refreshRate) * seamlessness *
-            kNonExactMatchingPenalty;
+    return 0;
 }
 
 struct RefreshRateScore {
@@ -449,7 +422,7 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
 
             const auto layerScore =
                     calculateLayerScoreLocked(layer, *scores[i].refreshRate, isSeamlessSwitch);
-            ALOGV("%s gives %s score of %.4f", formatLayerInfo(layer, weight).c_str(),
+            ALOGV("%s gives %s score of %.2f", formatLayerInfo(layer, weight).c_str(),
                   scores[i].refreshRate->getName().c_str(), layerScore);
             scores[i].score += weight * layerScore;
         }
@@ -491,7 +464,7 @@ RefreshRate RefreshRateConfigs::getBestRefreshRateLocked(
         }
     }();
     if (globalSignals.touch && explicitDefaultVoteLayers == 0 && touchBoostForExplicitExact &&
-        bestRefreshRate->fps.lessThanWithMargin(touchRefreshRate.fps)) {
+        bestRefreshRate->getFps().lessThanWithMargin(touchRefreshRate.getFps())) {
         setTouchConsidered();
         ALOGV("TouchBoost - choose %s", touchRefreshRate.getName().c_str());
         return touchRefreshRate;
@@ -610,7 +583,7 @@ RefreshRateConfigs::UidToFrameRateOverride RefreshRateConfigs::getFrameRateOverr
 
 template <typename Iter>
 const RefreshRate* RefreshRateConfigs::getBestRefreshRate(Iter begin, Iter end) const {
-    constexpr auto kEpsilon = 0.0001f;
+    constexpr auto EPSILON = 0.001f;
     const RefreshRate* bestRefreshRate = begin->refreshRate;
     float max = begin->score;
     for (auto i = begin; i != end; ++i) {
@@ -619,7 +592,7 @@ const RefreshRate* RefreshRateConfigs::getBestRefreshRate(Iter begin, Iter end) 
 
         ATRACE_INT(refreshRate->getName().c_str(), round<int>(score * 100));
 
-        if (score > max * (1 + kEpsilon)) {
+        if (score > max * (1 + EPSILON)) {
             max = score;
             bestRefreshRate = refreshRate;
         }
@@ -707,7 +680,28 @@ void RefreshRateConfigs::setCurrentModeId(DisplayModeId modeId) {
 RefreshRateConfigs::RefreshRateConfigs(const DisplayModes& modes, DisplayModeId currentModeId,
                                        Config config)
       : mKnownFrameRates(constructKnownFrameRates(modes)), mConfig(config) {
+    initializeIdleTimer();
     updateDisplayModes(modes, currentModeId);
+}
+
+void RefreshRateConfigs::initializeIdleTimer() {
+    if (mConfig.idleTimerTimeoutMs > 0) {
+        const auto getCallback = [this]() -> std::optional<IdleTimerCallbacks::Callbacks> {
+            std::scoped_lock lock(mIdleTimerCallbacksMutex);
+            if (!mIdleTimerCallbacks.has_value()) return {};
+            return mConfig.supportKernelIdleTimer ? mIdleTimerCallbacks->kernel
+                                                  : mIdleTimerCallbacks->platform;
+        };
+
+        mIdleTimer.emplace(
+                "IdleTimer", std::chrono::milliseconds(mConfig.idleTimerTimeoutMs),
+                [getCallback] {
+                    if (const auto callback = getCallback()) callback->onReset();
+                },
+                [getCallback] {
+                    if (const auto callback = getCallback()) callback->onExpired();
+                });
+    }
 }
 
 void RefreshRateConfigs::updateDisplayModes(const DisplayModes& modes,
@@ -727,8 +721,7 @@ void RefreshRateConfigs::updateDisplayModes(const DisplayModes& modes,
     for (const auto& mode : modes) {
         const auto modeId = mode->getId();
         mRefreshRates.emplace(modeId,
-                              std::make_unique<RefreshRate>(modeId, mode, mode->getFps(),
-                                                            RefreshRate::ConstructorTag(0)));
+                              std::make_unique<RefreshRate>(mode, RefreshRate::ConstructorTag(0)));
         if (modeId == currentModeId) {
             mCurrentRefreshRate = mRefreshRates.at(modeId).get();
         }
@@ -821,7 +814,7 @@ RefreshRateConfigs::Policy RefreshRateConfigs::getDisplayManagerPolicy() const {
 bool RefreshRateConfigs::isModeAllowed(DisplayModeId modeId) const {
     std::lock_guard lock(mLock);
     for (const RefreshRate* refreshRate : mAppRequestRefreshRates) {
-        if (refreshRate->modeId == modeId) {
+        if (refreshRate->getModeId() == modeId) {
             return true;
         }
     }
@@ -836,7 +829,7 @@ void RefreshRateConfigs::getSortedRefreshRateListLocked(
     for (const auto& [type, refreshRate] : mRefreshRates) {
         if (shouldAddRefreshRate(*refreshRate)) {
             ALOGV("getSortedRefreshRateListLocked: mode %d added to list policy",
-                  refreshRate->modeId.value());
+                  refreshRate->getModeId().value());
             outRefreshRates->push_back(refreshRate.get());
         }
     }
@@ -952,17 +945,6 @@ int RefreshRateConfigs::getFrameRateDivider(Fps displayFrameRate, Fps layerFrame
     return static_cast<int>(numPeriodsRounded);
 }
 
-bool RefreshRateConfigs::isFractionalPairOrMultiple(Fps smaller, Fps bigger) {
-    if (smaller.getValue() > bigger.getValue()) {
-        return isFractionalPairOrMultiple(bigger, smaller);
-    }
-
-    const auto multiplier = std::round(bigger.getValue() / smaller.getValue());
-    constexpr float kCoef = 1000.f / 1001.f;
-    return bigger.equalsWithMargin(Fps(smaller.getValue() * multiplier / kCoef)) ||
-            bigger.equalsWithMargin(Fps(smaller.getValue() * multiplier * kCoef));
-}
-
 void RefreshRateConfigs::dump(std::string& result) const {
     std::lock_guard lock(mLock);
     base::StringAppendF(&result, "DesiredDisplayModeSpecs (DisplayManager): %s\n\n",
@@ -984,6 +966,9 @@ void RefreshRateConfigs::dump(std::string& result) const {
 
     base::StringAppendF(&result, "Supports Frame Rate Override: %s\n",
                         mSupportsFrameRateOverride ? "yes" : "no");
+    base::StringAppendF(&result, "Idle timer: (%s) %s\n",
+                        mConfig.supportKernelIdleTimer ? "kernel" : "platform",
+                        mIdleTimer ? mIdleTimer->dump().c_str() : "off");
     result.append("\n");
 }
 
